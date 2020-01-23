@@ -1,4 +1,5 @@
 from os.path import join as pjoin
+import numpy as np
 from keras.datasets import imdb
 from keras.models import Sequential
 from keras.layers import Dense
@@ -42,6 +43,10 @@ class TranslationData:
 
     def __init__(self):
         self.logger = get_logger()
+        self.en_tk = None
+        self.fr_tk = None
+        self.en_sentences = None
+        self.fr_sentences = None
 
     def tokenize(self, sentences):
         tokenizer = Tokenizer()
@@ -49,23 +54,35 @@ class TranslationData:
         return tokenizer.texts_to_sequences(sentences), tokenizer
 
     def _read_file(self, file_name):
-        with open(pjoin("data", file_name), "r") as fin:
+        self.logger.info("START LOAD {}".format(file_name))
+        with open(pjoin("data", file_name), "r", encoding="utf8") as fin:
             lines = fin.readlines()
         return lines
 
     def load(self):
         en = self._read_file("small_vocab_en")
-        fr = self._read_file("small_vocab_fr")
         preprocess_en, en_tk = self.tokenize(en)
-        preprocess_fr, fr_tk = self.tokenize(fr)
-        preprocess_en = pad_sequences(preprocess_en, padding='post')
-        preprocess_fr = pad_sequences(preprocess_fr, padding='post')
-
-        self.logger.info("Max English sentence length {}".format(preprocess_en.shape[1]))
-        self.logger.info("Max French sentence length {}".format(preprocess_fr.shape[1]))
+        self.en_tk = en_tk
         self.logger.info("English vocabulary size {}".format(len(en_tk.word_index)))
+        fr = self._read_file("small_vocab_fr")
+        preprocess_fr, fr_tk = self.tokenize(fr)
+        self.fr_tk = fr_tk
         self.logger.info("French vocabulary size {}".format(len(fr_tk.word_index)))
 
+        maxlen = max(map(len, preprocess_en + preprocess_fr))
+        self.en_sentences = pad_sequences(preprocess_en, maxlen=maxlen, padding='post')
+        self.fr_sentences = pad_sequences(preprocess_fr, maxlen=maxlen, padding='post')
+        self.en_sentences = self.en_sentences.reshape(*self.en_sentences.shape, 1)
+        self.fr_sentences = self.fr_sentences.reshape(*self.fr_sentences.shape, 1)
+        assert self.en_sentences.shape == self.fr_sentences.shape
+
+    def logits_to_text(self, logits, mode="to"):
+        if mode == "to":
+            index_to_words = {i: word for word, i in self.fr_tk.word_index.items()}
+        else:
+            index_to_words = {i: word for word, i in self.en_tk.word_index.items()}
+        index_to_words[0] = '<PAD>'
+        return ' '.join([index_to_words[prediction] for prediction in np.argmax(logits, 1)])
 
 if __name__ == "__main__":
     # data = DataIMDB(top_words=50)
