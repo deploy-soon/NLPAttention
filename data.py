@@ -22,6 +22,8 @@ torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 class _TranslationDataset(Dataset):
 
     def __init__(self):
@@ -80,6 +82,13 @@ class Data:
         print("Unique tokens in source (en) vocabulary: {}".format(len(self.target.vocab)))
         return train_data, valid_data, test_data
 
+    def iterator(self):
+        train_data, valid_data, test_data = self.load()
+        train_iter, valid_iter, test_iter = BucketIterator.splits(
+            (train_data, valid_data, test_data),
+            batch_size = 128,
+            device=device)
+        return train_iter, valid_iter, test_iter
 
 if __name__ == "__main__":
     data = Data()
