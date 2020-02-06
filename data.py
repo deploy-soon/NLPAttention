@@ -1,45 +1,28 @@
 from os.path import join as pjoin
 import numpy as np
-from keras.datasets import imdb
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.layers import LSTM
-from keras.layers.embeddings import Embedding
-from keras.preprocessing.text import Tokenizer
-from keras.preprocessing.sequence import pad_sequences
-from keras.preprocessing import sequence
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+from torchtext.datasets import TranslationDataset, Multi30k
+from torchtext.data import Field, BucketIterator
+
+import spacy
+import random
+import math
+import time
 
 from misc import get_logger
 
-class DataIMDB:
 
-    def __init__(self, top_words=5000, max_len=256):
-        self.top_words = top_words
-        self.max_len = max_len
-
-    def load(self):
-        (X_train, y_train), (X_test, y_test) = imdb.load_data(num_words=self.top_words,
-                                                              maxlen=self.max_len)
-        X_train = sequence.pad_sequences(X_train, maxlen=self.max_len)
-        X_test = sequence.pad_sequences(X_test, maxlen=self.max_len)
-        print(X_train)
-        print(y_train)
-
-        embedding_vecor_length = 32
-        model = Sequential()
-        model.add(Embedding(50, embedding_vecor_length, input_length=256))
-        model.add(LSTM(100))
-        model.add(Dense(1, activation='sigmoid'))
-        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-        print(model.summary())
-        model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=3, batch_size=64)
-
-        # Final evaluation of the model
-        scores = model.evaluate(X_test, y_test, verbose=0)
-        print("Accuracy: %.2f%%" % (scores[1] * 100))
+SEED = 111
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
 
 
-class TranslationData:
+class _TranslationDataset(Dataset):
 
     def __init__(self):
         self.logger = get_logger()
@@ -48,44 +31,56 @@ class TranslationData:
         self.en_sentences = None
         self.fr_sentences = None
 
-    def tokenize(self, sentences):
-        tokenizer = Tokenizer()
-        tokenizer.fit_on_texts(sentences)
-        return tokenizer.texts_to_sequences(sentences), tokenizer
-
     def _read_file(self, file_name):
         self.logger.info("START LOAD {}".format(file_name))
         with open(pjoin("data", file_name), "r", encoding="utf8") as fin:
             lines = fin.readlines()
         return lines
 
+    def _tokenize(self, sentences):
+        word_dict = dict()
+        pivot = 1
+        sequences = []
+        for sentence in sentences:
+            words = sentence.strip().split()
+            for word in words:
+                if word not in word_dict:
+                    word_dict[word] = pivot
+                    pivot = pivot + 1
+            tokens = [word_dict[w] for w in words]
+            sequences.append(tokens)
+        return sequences, word_dict
+
+
+
+class Data:
+
+    def __init__(self):
+        spacy_de = spacy.load('de')
+        spacy_en = spacy.load('en')
+        self.source = Field(tokenize=lambda text: [t.text for t in spacy_de.tokenizer(text)][::-1],
+                            init_token='<sos>',
+                            eos_token='<eos>',
+                            lower=True)
+        self.target = Field(tokenize=lambda text: [t.text for t in spacy_en.tokenizer(text)],
+                            init_token='<sos>',
+                            eos_token='<eos>',
+                            lower=True)
+
     def load(self):
-        en = self._read_file("small_vocab_en")
-        preprocess_en, en_tk = self.tokenize(en)
-        self.en_tk = en_tk
-        self.logger.info("English vocabulary size {}".format(len(en_tk.word_index)))
-        fr = self._read_file("small_vocab_fr")
-        preprocess_fr, fr_tk = self.tokenize(fr)
-        self.fr_tk = fr_tk
-        self.logger.info("French vocabulary size {}".format(len(fr_tk.word_index)))
+        train_data, valid_data, test_data = Multi30k.splits(exts=('.de', '.en'),
+                                                            fields=(self.source, self.target))
+        print("Number of training examples: {}".format(len(train_data.examples)))
+        print("Number of validation examples: {}".format(len(valid_data.examples)))
+        print("Number of testing examples: {}".format(len(test_data.examples)))
 
-        maxlen = max(map(len, preprocess_en + preprocess_fr))
-        self.en_sentences = pad_sequences(preprocess_en, maxlen=maxlen, padding='post')
-        self.fr_sentences = pad_sequences(preprocess_fr, maxlen=maxlen, padding='post')
-        self.en_sentences = self.en_sentences.reshape(*self.en_sentences.shape, 1)
-        self.fr_sentences = self.fr_sentences.reshape(*self.fr_sentences.shape, 1)
-        assert self.en_sentences.shape == self.fr_sentences.shape
+        self.source.build_vocab(train_data, min_freq=2)
+        self.target.build_vocab(train_data, min_freq=2)
+        print("Unique tokens in source (de) vocabulary: {}".format(len(self.source.vocab)))
+        print("Unique tokens in source (en) vocabulary: {}".format(len(self.target.vocab)))
+        return train_data, valid_data, test_data
 
-    def logits_to_text(self, logits, mode="to"):
-        if mode == "to":
-            index_to_words = {i: word for word, i in self.fr_tk.word_index.items()}
-        else:
-            index_to_words = {i: word for word, i in self.en_tk.word_index.items()}
-        index_to_words[0] = '<PAD>'
-        return ' '.join([index_to_words[prediction] for prediction in np.argmax(logits, 1)])
 
 if __name__ == "__main__":
-    # data = DataIMDB(top_words=50)
-    # data.load()
-    data = TranslationData()
+    data = Data()
     data.load()
