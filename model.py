@@ -1,84 +1,263 @@
-import fire
+#import fire
+import math
+import time
+import random
 import pathlib
 import numpy as np
 from os.path import join as pjoin
 
-from keras.models import Model, Sequential
-from keras.layers import GRU, Input, Dense, TimeDistributed, Activation, RepeatVector, Bidirectional, Dropout, LSTM
-from keras.layers.embeddings import Embedding
-from keras.optimizers import Adam
-from keras.losses import sparse_categorical_crossentropy
-from keras import backend as K
-from keras.callbacks import ModelCheckpoint, TensorBoard
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 from misc import get_logger
-from data import TranslationData
+from data import Data
 
 
-class TranslationModel:
-    """
-    1. rnn, lstm, gru, bdlstm, attention
-    """
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def __init__(self, learning_rate, batch_size, epochs, validation_rate):
-        self.data = TranslationData()
-        self.data.load()
-        self.learning_rate = learning_rate
-        self.batch_size = batch_size
+
+class Encoder(nn.Module):
+
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
+        """
+        :param input_dim: the size of the one-hot vectors that will be input
+        :param emb_dim: the dimensionality of the embedding layer
+        :param hid_dim: the dimensionality of the hidden and cell states
+        :param n_layers: the number of layers in RNN
+        :param dropout: amount of dropout to use
+        """
+        super().__init__()
+
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout = dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+
+        # src = [src len, batch size]
+
+        embedded = self.dropout(self.embedding(src))
+
+        # embedded = [src len, batch size, emb dim]
+
+        outputs, (hidden, cell) = self.rnn(embedded)
+
+        # outputs = [src len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+        return hidden, cell
+
+class Decoder(nn.Module):
+
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
+        self.output_dim = output_dim
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout = dropout)
+        self.fc_out = nn.Linear(hid_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, cell):
+        #input = [barch_size]
+        #hidden = [n layers * n directions, batch size, hid dim]
+        #cell = [n layers * n directions, batch size, hid dim]
+        # n directions in the decoder will both always be 1, therefore
+        # hidden = [n layers, batch size, hid dim]
+        # context = [n layers, batch size, hid dim]
+
+        input = input.unsqueeze(0)
+        #input = [1, batch size]
+
+        embedded = self.dropout(self.embedding(input))
+        #embedded = [1, batch size, emb dim]
+
+        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
+
+        #output = [seq len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+
+        # seq len and n directions will always be 1 in the decoder, therfore,
+        # output = [1, batch size, hid dim]
+        # hidden = [n layers, batch size, hid dim]
+        # cell = [n layers, batch size, hid dim]
+
+        prediction = self.fc_out(output.squeeze(0))
+        #prediction = [batch_size, output_dim]
+
+        return prediction, hidden, cell
+
+
+class Seq2Seq(nn.Module):
+
+    def __init__(self, encoder, decoder, device):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+        assert encoder.hid_dim == decoder.hid_dim
+        assert encoder.n_layers == encoder.n_layers
+
+    def forward(self, src, trg, teacher_forcing_ratio = 0.5):
+        """
+        :param src: shape (src len, batch size)
+        :param trg: shape (trg len, batch size)
+        :param teacher_forcing_ratio: probability to use teacher forcing
+        """
+        batch_size = trg.shape[1]
+        trg_len = trg.shape[0]
+        trg_vocab_size = self.decoder.output_dim
+
+        outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
+
+        hidden, cell = self.encoder(src)
+
+        #first input to the decoder is the <sos> tokens
+        ipt = trg[0, :]
+
+        for t in range(1, trg_len):
+
+            output, hidden, cell = self.decoder(ipt, hidden, cell)
+            outputs[t] = output
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+
+            ipt = trg[t] if teacher_force else top1
+
+        return outputs
+
+
+class Train:
+
+    def __init__(self, enc_emb_dim=256, dec_emb_dim=256,
+                 hid_dim=512, n_layers=2,
+                 enc_dropout=0.5, dec_dropout=0.5,
+                 epochs=15):
+
+        self.data = Data()
+        self.train_iter, self.valid_iter, self.test_iter = self.data.iterator()
+        self.input_dim = len(self.data.source.vocab)
+        self.output_dim = len(self.data.target.vocab)
+
+        self.enc_emb_dim = enc_emb_dim
+        self.dec_emb_dim = dec_emb_dim
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+        self.enc_dropout = enc_dropout
+        self.dec_dropout = dec_dropout
+
+        self.encoder = Encoder(self.input_dim,
+                               self.enc_emb_dim,
+                               self.hid_dim,
+                               self.n_layers,
+                               self.enc_dropout)
+        self.decoder = Decoder(self.output_dim,
+                               self.dec_emb_dim,
+                               self.hid_dim,
+                               self.n_layers,
+                               self.dec_dropout)
+        self.model = Seq2Seq(self.encoder, self.decoder, device).to(device)
+
         self.epochs = epochs
-        self.validation_rate = validation_rate
-        self._feed_forward = None
+        target_padding_index = self.data.target.vocab.stoi[self.data.target.pad_token]
+        self.criterion = nn.CrossEntropyLoss(ignore_index = target_padding_index)
 
-    def build(self):
-        raise NotImplementedError
+    @staticmethod
+    def init_weights(m):
+        for name, param in m.named_parameters():
+            nn.init.uniform_(param.data, -0.08, 0.08)
 
-    def feed_forward(self, x):
-        if self._feed_forward is not None:
-            raise NotImplementedError
-        inference = self._feed_forward([x.reshape(1, -1, 1), 0])
-        return inference.reshape(-1) # flatten
+    def count_parameters(self, model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    def feed_forward_batch(self, x):
-        if self._feed_forward is not None:
-            raise NotImplementedError
-        inference = self._feed_forward([x, 0])
-        return inference
+    def train(self, iterator, optimizer, criterion, clip):
+        self.model.train()
+        epoch_loss = 0
+        for i, batch in enumerate(iterator):
 
-    def run(self):
-        net = self.build()
-        print(net.summary())
-        net.fit(x=self.data.en_sentences,
-                y=self.data.fr_sentences,
-                batch_size=self.batch_size,
-                epochs=self.epochs,
-                validation_split=self.validation_rate)
-        print(self.data.logits_to_text(net.predict(self.data.en_sentences[:1])[0]))
+            src = batch.src
+            trg = batch.trg
 
+            optimizer.zero_grad()
+            output = self.model(src, trg)
+            # trg = [trg len, batch size]
+            # output = [trg len, batch size, output dim]
+            output_dim = output.shape[-1]
+            output = output[1:].view(-1, output_dim)
+            trg = trg[1:].view(-1)
+            #trg = [(trg len -1) * batch size]
+            #output = [(trg len -1) * batch size, output dim]
 
-class GRU(Model):
+            loss = criterion(output, trg)
+            loss.backward()
 
-    def build(self):
-        input_shape = self.data.en_sentences.shape
-        output_dim_size = len(self.data.fr_tk.word_index)
-        model = Sequential()
-        model.add(GRU(256, input_shape=input_shape[1:], return_sequences=True))
-        model.add(TimeDistributed(Dense(1024, activation='relu')))
-        model.add(Dropout(0.5))
-        model.add(TimeDistributed(Dense(output_dim_size + 1, activation='softmax')))
+            torch.nn.utils.clip_grad_norm(self.model.parameters(), clip)
+            optimizer.step()
+            epoch_loss += loss.item()
+        return epoch_loss / len(iterator)
 
-        # model = Model()
-        model.compile(loss=sparse_categorical_crossentropy,
-                      optimizer=Adam(self.learning_rate),
-                      metrics=['accuracy'])
-        self._feed_forward = K.function([model.input, K.learning_phase()],
-                                        [model.get_layer("logits").output])
-        return model
+    def evaluate(self, iterator, criterion):
+        self.model.eval()
+        epoch_loss = 0
+        with torch.no_grad():
+            for i, batch in enumerate(iterator):
+                src = batch.src
+                trg = batch.trg
+
+                output = self.model(src, trg, 0.0)
+
+                #trg = [trg len, batch size]
+                #output = [trg len, batch size, output dim]
+
+                output_dim = output.shape[-1]
+                output = output[1:].view(-1, output_dim)
+                trg = trg[1:].view(-1)
+                loss = criterion(output, trg)
+                epoch_loss += loss.item()
+        return epoch_loss / len(iterator)
+
+    def _epoch_time(self, start_time, end_time):
+        elapsed_time = end_time - start_time
+        elapsed_mins = int(elapsed_time / 60)
+        elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
+        return elapsed_mins, elapsed_secs
 
     def test(self):
-        pass
+        self.model.load_state_dict(torch.load('tut1-model.pt'))
+        test_loss = self.evaluate(self.test_iter, self.criterion)
+        print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
 
+    def run(self):
+        self.model.apply(self.init_weights)
+        print("Model trainable parametes: {}".format(self.count_parameters(self.model)))
+
+        optimizer = optim.Adam(self.model.parameters())
+
+        CLIP = 1
+        best_valid_loss = float('inf')
+        for epoch in range(self.epochs):
+            start_time = time.time()
+            train_loss = self.train(self.train_iter, optimizer, self.criterion, CLIP)
+            valid_loss = self.evaluate(self.valid_iter, self.criterion)
+            end_time = time.time()
+
+            epoch_mins, epoch_secs = self._epoch_time(start_time, end_time)
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                torch.save(self.model.state_dict(), 'tut1-model.pt')
+            print(f'Epoch: {epoch+1:02} | Time: {epoch_mins}m {epoch_secs}s')
+            print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
+            print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
 
 if __name__ == "__main__":
-    model = Model()
-    model.run()
+    train = Train()
+    train.run()
+    train.test()
