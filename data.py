@@ -24,14 +24,20 @@ torch.backends.cudnn.deterministic = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-class _TranslationDataset(Dataset):
+class FRENDataset(Dataset):
 
     def __init__(self):
         self.logger = get_logger()
-        self.en_tk = None
-        self.fr_tk = None
-        self.en_sentences = None
-        self.fr_sentences = None
+        self.init_token = '<sos>'
+        self.end_token = '<eos>'
+        en = self._read_file("small_vocab_en")
+        fr = self._read_file("small_vocab_fr")
+        assert len(en) == len(fr)
+        self.en_sequences, self.en_dict = self._tokenize(en)
+        self.fr_sequences, self.fr_dict = self._tokenize(fr)
+        self.source_dim = len(self.en_dict) + 1
+        self.target_dim = len(self.fr_dict) + 1
+        self.end_token_pivot = 2
 
     def _read_file(self, file_name):
         self.logger.info("START LOAD {}".format(file_name))
@@ -40,18 +46,34 @@ class _TranslationDataset(Dataset):
         return lines
 
     def _tokenize(self, sentences):
-        word_dict = dict()
-        pivot = 1
+        word_dict = {
+            self.init_token: 1,
+            self.end_token: 2,
+        }
+        pivot = 3
         sequences = []
         for sentence in sentences:
             words = sentence.strip().split()
+            words = [self.init_token] + words + [self.end_token]
             for word in words:
                 if word not in word_dict:
                     word_dict[word] = pivot
                     pivot = pivot + 1
             tokens = [word_dict[w] for w in words]
             sequences.append(tokens)
-        return sequences, word_dict
+        max_len = max(map(len, sequences))
+        self.logger.info("MAX LEN : {}".format(max_len))
+        self.logger.info("TOTAL SEQ: {}".format(len(sequences)))
+        for sequence in sequences:
+            seq_len = len(sequence)
+            sequence.extend([2] * (max_len - seq_len))
+        return torch.tensor(sequences), word_dict
+
+    def __len__(self):
+        return len(self.en_sequences)
+
+    def __getitem__(self, index):
+        return self.en_sequences[index], self.fr_sequences[index]
 
 
 
@@ -91,5 +113,13 @@ class Data:
         return train_iter, valid_iter, test_iter
 
 if __name__ == "__main__":
-    data = Data()
-    data.load()
+    #data = Data()
+    #data.load()
+    data = FRENDataset()
+    data_len = len(data)
+    trainset, validset = torch.utils.data.random_split(data, [24, data_len - 24])
+    train_loader = DataLoader(trainset, batch_size=12, shuffle=True, num_workers=2)
+    print(train_loader.batch_size)
+    for i, batch in enumerate(train_loader):
+        print(i, batch[1].transpose_(0, 1).to(device))
+        

@@ -9,9 +9,10 @@ from os.path import join as pjoin
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import random_split, DataLoader
 
 from misc import get_logger
-from data import Data
+from data import Data, FRENDataset
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -141,11 +142,22 @@ class Train:
                  hid_dim=512, n_layers=2,
                  enc_dropout=0.5, dec_dropout=0.5,
                  epochs=15):
-
-        self.data = Data()
-        self.train_iter, self.valid_iter, self.test_iter = self.data.iterator()
-        self.input_dim = len(self.data.source.vocab)
-        self.output_dim = len(self.data.target.vocab)
+        self.logger = get_logger()
+        #self.data = Data()
+        self.data = FRENDataset()
+        data_len = len(self.data)
+        train_num = int(data_len * 0.8)
+        valid_num = int(data_len * 0.1)
+        test_num = data_len - train_num - valid_num
+        train, valid, test = random_split(self.data, [train_num, valid_num, test_num])
+        self.train_iter = DataLoader(train, batch_size = 64, shuffle=True, num_workers=4)
+        self.valid_iter = DataLoader(valid, batch_size = 64, shuffle=True, num_workers=4)
+        self.test_iter = DataLoader(test, batch_size = 64, shuffle=True, num_workers=4)
+        #self.train_iter, self.valid_iter, self.test_iter = self.data.iterator()
+        #self.input_dim = len(self.data.source.vocab)
+        #self.output_dim = len(self.data.target.vocab)
+        self.input_dim = self.data.source_dim
+        self.output_dim = self.data.target_dim
 
         self.enc_emb_dim = enc_emb_dim
         self.dec_emb_dim = dec_emb_dim
@@ -167,8 +179,9 @@ class Train:
         self.model = Seq2Seq(self.encoder, self.decoder, device).to(device)
 
         self.epochs = epochs
-        target_padding_index = self.data.target.vocab.stoi[self.data.target.pad_token]
-        self.criterion = nn.CrossEntropyLoss(ignore_index = target_padding_index)
+        #target_padding_index = self.data.target.vocab.stoi[self.data.target.pad_token]
+        #self.criterion = nn.CrossEntropyLoss(ignore_index = target_padding_index)
+        self.criterion = nn.CrossEntropyLoss(ignore_index = self.data.end_token_pivot)
 
     @staticmethod
     def init_weights(m):
@@ -182,9 +195,10 @@ class Train:
         self.model.train()
         epoch_loss = 0
         for i, batch in enumerate(iterator):
-
-            src = batch.src
-            trg = batch.trg
+            src = batch[0].transpose_(0, 1).to(device)
+            trg = batch[1].transpose_(0, 1).to(device)
+            #src = batch.src
+            #trg = batch.trg
 
             optimizer.zero_grad()
             output = self.model(src, trg)
@@ -209,9 +223,10 @@ class Train:
         epoch_loss = 0
         with torch.no_grad():
             for i, batch in enumerate(iterator):
-                src = batch.src
-                trg = batch.trg
-
+                src = batch[0].transpose_(0, 1).to(device)
+                trg = batch[1].transpose_(0, 1).to(device)
+                #src = batch.src
+                #trg = batch.trg
                 output = self.model(src, trg, 0.0)
 
                 #trg = [trg len, batch size]
@@ -231,13 +246,13 @@ class Train:
         return elapsed_mins, elapsed_secs
 
     def test(self):
-        self.model.load_state_dict(torch.load('tut1-model.pt'))
+        self.model.load_state_dict(torch.load(pjoin('model', 'base.pt')))
         test_loss = self.evaluate(self.test_iter, self.criterion)
-        print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
+        self.logger.info(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
 
     def run(self):
         self.model.apply(self.init_weights)
-        print("Model trainable parametes: {}".format(self.count_parameters(self.model)))
+        self.logger.info("Model trainable parametes: {}".format(self.count_parameters(self.model)))
 
         optimizer = optim.Adam(self.model.parameters())
 
@@ -252,12 +267,12 @@ class Train:
             epoch_mins, epoch_secs = self._epoch_time(start_time, end_time)
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
-                torch.save(self.model.state_dict(), 'tut1-model.pt')
-            print(f'Epoch: {epoch+1:02} | Time: {epoch_mins}m {epoch_secs}s')
-            print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
-            print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
+                torch.save(self.model.state_dict(), pjoin('model', 'base.pt'))
+            self.logger.info(f'Epoch: {epoch+1:02} | Time: {epoch_mins}m {epoch_secs}s')
+            self.logger.info(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
+            self.logger.info(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
 
 if __name__ == "__main__":
-    train = Train()
+    train = Train(epochs=5, n_layers=2)
     train.run()
     train.test()
