@@ -66,7 +66,7 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, input, hidden, cell):
-        #input = [barch_size]
+        #input = [batch_size]
         #hidden = [n layers * n directions, batch size, hid dim]
         #cell = [n layers * n directions, batch size, hid dim]
         # n directions in the decoder will both always be 1, therefore

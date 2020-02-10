@@ -112,14 +112,3 @@ class Data:
             device=device)
         return train_iter, valid_iter, test_iter
 
-if __name__ == "__main__":
-    #data = Data()
-    #data.load()
-    data = FRENDataset()
-    data_len = len(data)
-    trainset, validset = torch.utils.data.random_split(data, [24, data_len - 24])
-    train_loader = DataLoader(trainset, batch_size=12, shuffle=True, num_workers=2)
-    print(train_loader.batch_size)
-    for i, batch in enumerate(train_loader):
-        print(i, batch[1].transpose_(0, 1).to(device))
-        
