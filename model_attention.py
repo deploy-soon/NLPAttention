@@ -9,6 +9,7 @@ from os.path import join as pjoin
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import random_split, DataLoader
 
 from misc import get_logger
@@ -20,51 +21,92 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Encoder(nn.Module):
 
-    def __init__(self, input_dim, emb_dim, hid_dim, dropout):
+    def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout):
         """
         :param input_dim: the size of the one-hot vectors that will be input
         :param emb_dim: the dimensionality of the embedding layer
-        :param hid_dim: the dimensionality of the hidden and cell states
+        :param enc_hid_dim: the dimensionality of the encoder hidden states
+        :param dec_hid_dim: the dimensionality of the decoder hidden states
         :param dropout: amount of dropout to use
         """
         super().__init__()
 
-        self.hid_dim = hid_dim
-
         self.embedding = nn.Embedding(input_dim, emb_dim)
-        self.rnn = nn.GRU(emb_dim, hid_dim)
+        self.rnn = nn.GRU(emb_dim, enc_hid_dim, bidirectional=True)
+        self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src):
 
         # src = [src len, batch size]
         embedded = self.dropout(self.embedding(src))
-
         # embedded = [src len, batch size, emb dim]
-        outputs, hidden = self.rnn(embedded)
 
+        outputs, hidden = self.rnn(embedded)
         # outputs = [src len, batch size, hid dim * n directions]
-        return hidden
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # hidden is stacked [forward1, backward1, forward2, backward2, ...]
+        # just use last forwawd and backward context
+        # hidden [-2, :, :] is the last forwards RNN
+        # hidden [-1, :, :] is the last backwards RNN
+
+        # use final hidden state of the forwards and backwards to put in 
+        # hidden state of the decoder
+        hidden = torch.tanh(self.fc(torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)))
+
+        # outputs = [ src len, batch size, enc hid dim * 2]
+        # hidden = [batch size, dec hid dim]
+
+        return outputs, hidden
+
+
+class Attention(nn.Module):
+
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        self.attn = nn.Linear(enc_hid_dim * 2 + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias = False)
+
+    def forward(self, hidden, encoder_outputs):
+        """
+        :param hidden: [batch size, dec hid dim]
+        :param encoder_outputs: [src len, batch size, enc hid dim*2]
+        merge hidden states of decoder and bidrectional output of encoder
+        """
+        batch_size = encoder_outputs.shape[1]
+        src_len = encoder_outputs.shape[0]
+
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+        encoder_outputs = encoder_outputs.permute(1, 0, 2)
+        #hidden = [batch size, src len, dec hid dim]
+        #encoder_outputs = [batch size, src len, enc hid dim * 2]
+
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        #energy = [batch size, src len, dec hid dim]
+
+        attention = self.v(energy).squeeze(2)
+        #attention = [batch size, src len]
+
+        return F.softmax(attention, dim=1)
+
 
 class Decoder(nn.Module):
 
-    def __init__(self, output_dim, emb_dim, hid_dim, dropout):
+    def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim,
+                 dropout, attention):
         super().__init__()
         self.output_dim = output_dim
-        self.hid_dim = hid_dim
+        self.attention = attention
 
         self.embedding = nn.Embedding(output_dim, emb_dim)
-        self.rnn = nn.GRU(emb_dim + hid_dim, hid_dim)
-        self.fc_out = nn.Linear(emb_dim + 2 * hid_dim, output_dim)
+        self.rnn = nn.GRU(emb_dim + enc_hid_dim * 2, dec_hid_dim)
+        self.fc_out = nn.Linear(emb_dim + 2 * enc_hid_dim + dec_hid_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, ipt, hidden, context):
+    def forward(self, ipt, hidden, encoder_outputs):
         #input = [batch_size]
-        #hidden = [n directions, batch size, hid dim]
-        #context = [n directions, batch size, hid dim]
-        # n directions in the decoder will both always be 1, therefore
-        # hidden = [1, batch size, hid dim]
-        # context = [1, batch size, hid dim]
+        #hidden = [batch size, dec hid dim]
+        #encoder_outputs = [src len, batch size, enc hid dim * 2]
 
         ipt = ipt.unsqueeze(0)
         #ipt = [1, batch size]
@@ -72,26 +114,36 @@ class Decoder(nn.Module):
         embedded = self.dropout(self.embedding(ipt))
         #embedded = [1, batch size, emb dim]
 
-        emb_con = torch.cat((embedded, context), dim = 2)
-        # emb_con = [1, batch size, emb dim + hid dim)
+        attn = self.attention(hidden, encoder_outputs)
+        attn = attn.unsqueeze(1)
+        # attn = [batch size, 1, src len]
+        
+        encoder_outputs = encoder_outputs.permute(1, 0, 2)
+        #encoder_outputs = [batch size, sec len, enc hid dim * 2]
 
-        output, hidden = self.rnn(emb_con, hidden)
+        weighted = torch.bmm(attn, encoder_outputs)
+        weighted = weighted.permute(1, 0, 2)
+        #weighted = [1, batch size, enc hid dim * 2]
 
-        #output = [seq len, batch size, hid dim * n directions]
-        # hidden = [n directions, batch size, hid dim]
+        rnn_input = torch.cat((embedded, weighted), dim = 2)
+        #rnn_input = [1, batch size, enc hid dim * 2 + emb dim]
+
+        output, hidden = self.rnn(rnn_input, hidden.unsqueeze(0))
+        #output = [seq len, batch size, dec hid dim * n directions]
+        # hidden = [n directions, batch size, dec hid dim]
 
         # seq len and n directions will always be 1 in the decoder, therfore,
-        # output = [1, batch size, hid dim]
-        # hidden = [1, batch size, hid dim]
-        
-        output = torch.cat((embedded.squeeze(0), hidden.squeeze(0), context.squeeze(0)),
-                           dim = 1)
-        # output = [batch size, emb dim + hid dim * 2]
+        # output = [1, batch size, dec hid dim]
+        # hidden = [1, batch size, dec hid dim]
+        assert (output == hidden).all()
 
-        prediction = self.fc_out(output)
+        embedded = embedded.squeeze(0)
+        output = output.squeeze(0)
+        weighted = weighted.squeeze(0)
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1))
         #prediction = [batch_size, output_dim]
 
-        return prediction, hidden
+        return prediction, hidden.squeeze(0)
 
 
 class Seq2Seq(nn.Module):
@@ -101,8 +153,6 @@ class Seq2Seq(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.device = device
-
-        assert encoder.hid_dim == decoder.hid_dim
 
     def forward(self, src, trg, teacher_forcing_ratio = 0.5):
         """
@@ -116,14 +166,13 @@ class Seq2Seq(nn.Module):
 
         outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
 
-        context = self.encoder(src)
-        hidden = context
+        encoder_outputs, hidden = self.encoder(src)
         #first input to the decoder is the <sos> tokens
         ipt = trg[0, :]
 
         for t in range(1, trg_len):
 
-            output, hidden = self.decoder(ipt, hidden, context)
+            output, hidden = self.decoder(ipt, hidden, encoder_outputs)
             outputs[t] = output
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = output.argmax(1)
@@ -136,7 +185,7 @@ class Seq2Seq(nn.Module):
 class Train:
 
     def __init__(self, enc_emb_dim=128, dec_emb_dim=128,
-                 hid_dim=256,
+                 enc_hid_dim=256, dec_hid_dim=256,
                  enc_dropout=0.3, dec_dropout=0.3,
                  epochs=15):
         self.logger = get_logger()
@@ -147,9 +196,9 @@ class Train:
         valid_num = int(data_len * 0.1)
         test_num = data_len - train_num - valid_num
         train, valid, test = random_split(self.data, [train_num, valid_num, test_num])
-        self.train_iter = DataLoader(train, batch_size = 64, shuffle=True, num_workers=4)
-        self.valid_iter = DataLoader(valid, batch_size = 64, shuffle=True, num_workers=4)
-        self.test_iter = DataLoader(test, batch_size = 64, shuffle=True, num_workers=4)
+        self.train_iter = DataLoader(train, batch_size = 128, shuffle=True, num_workers=4)
+        self.valid_iter = DataLoader(valid, batch_size = 128, shuffle=True, num_workers=4)
+        self.test_iter = DataLoader(test, batch_size = 128, shuffle=True, num_workers=4)
         #self.train_iter, self.valid_iter, self.test_iter = self.data.iterator()
         #self.input_dim = len(self.data.source.vocab)
         #self.output_dim = len(self.data.target.vocab)
@@ -158,18 +207,23 @@ class Train:
 
         self.enc_emb_dim = enc_emb_dim
         self.dec_emb_dim = dec_emb_dim
-        self.hid_dim = hid_dim
+        self.enc_hid_dim = enc_hid_dim
+        self.dec_hid_dim = dec_hid_dim
         self.enc_dropout = enc_dropout
         self.dec_dropout = dec_dropout
 
         self.encoder = Encoder(self.input_dim,
                                self.enc_emb_dim,
-                               self.hid_dim,
+                               self.enc_hid_dim,
+                               self.dec_hid_dim,
                                self.enc_dropout)
+        self.attention = Attention(self.enc_hid_dim, self.dec_hid_dim)
         self.decoder = Decoder(self.output_dim,
                                self.dec_emb_dim,
-                               self.hid_dim,
-                               self.dec_dropout)
+                               self.enc_hid_dim,
+                               self.dec_hid_dim,
+                               self.dec_dropout,
+                               self.attention)
         self.model = Seq2Seq(self.encoder, self.decoder, device).to(device)
 
         self.epochs = epochs
@@ -180,7 +234,10 @@ class Train:
     @staticmethod
     def init_weights(m):
         for name, param in m.named_parameters():
-            nn.init.normal_(param.data, mean=0, std=0.01)
+            if 'weight' in name:
+                nn.init.normal_(param.data, mean=0, std=0.01)
+            else:
+                nn.init.constant_(param.data, 0)
 
     def count_parameters(self, model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -246,6 +303,7 @@ class Train:
 
     def run(self):
         self.model.apply(self.init_weights)
+        print(self.model)
         self.logger.info("Model trainable parametes: {}".format(self.count_parameters(self.model)))
 
         optimizer = optim.Adam(self.model.parameters())
